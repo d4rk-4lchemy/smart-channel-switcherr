@@ -1,0 +1,27 @@
+{
+  "name": "Smart Channel Switcherr",
+  "version": "1.0.0",
+  "description": "Delays stream source selection to allow recently-stopped channels to release their provider connections before a new channel assignment runs. Smart Delay only waits when the target provider is already at its concurrent limit.",
+  "author": "Tfuj Stary",
+  "help_url": "https://github.com/d4rk-4lchemy/smart-channel-switcherr",
+  "fields": [
+    {
+      "id": "wait_seconds",
+      "label": "Wait before selecting stream source",
+      "type": "number",
+      "default": 2.0,
+      "min": 0,
+      "max": 30,
+      "step": 0.5,
+      "help_text": "Seconds to wait before selecting a stream source. Only the first attempt per request is delayed; retries are not. Set to 0 to disable."
+    },
+    {
+      "id": "smart_delay",
+      "label": "Smart Delay",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Only apply the delay when the target channel's first eligible M3U account is already at its concurrent stream limit, based on the same active TS channel scan used by /proxy/ts/status."
+    }
+  ],
+  "actions": []
+}
