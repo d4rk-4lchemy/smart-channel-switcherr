@@ -1,23 +1,31 @@
 """
 Smart Channel Switcherr plugin.
 
-Monkey-patches apps.proxy.ts_proxy.views.generate_stream_url to insert
-an optional delay before the FIRST stream source selection per request.
-Retries within the same request (same greenlet) are not delayed.
+Monkey-patches apps.proxy.ts_proxy.views.stream_ts and
+apps.proxy.ts_proxy.views.generate_stream_url to insert an optional delay
+before the FIRST stream source selection per request. Retries within the
+same request (same greenlet) are not delayed.
 
 If Smart Delay is enabled, the plugin only waits when the target channel's
 first eligible M3U account is already at its concurrent limit, based on the
-same Redis-backed channel metadata scan used by /proxy/ts/status.
+same Redis-backed channel metadata scan used by /proxy/ts/status, and the
+request comes from the same client (IP + User-Agent) that already has an
+active connection on that account.
 
-Install: copy this directory to /data/plugins/wait-for-selection/
+Install: copy this directory to /data/plugins/smart-channel-switcherr/
 """
+from functools import wraps
 import logging
 
 logger = logging.getLogger(__name__)
 
-_PATCH_MARKER = "_wait_for_selection_patched"
-_ORIGINAL_FN_ATTR = "_wait_for_selection_original_fn"
-_PLUGIN_KEY = "wait-for-selection"
+_GENERATE_PATCH_MARKER = "_smart_channel_switcherr_generate_patched"
+_ORIGINAL_GENERATE_FN_ATTR = "_smart_channel_switcherr_original_generate_fn"
+_STREAM_TS_PATCH_MARKER = "_smart_channel_switcherr_stream_ts_patched"
+_ORIGINAL_STREAM_TS_ATTR = "_smart_channel_switcherr_original_stream_ts"
+_PLUGIN_KEY = "smart-channel-switcherr"
+
+# States that mean a channel is holding an active provider connection.
 _OCCUPYING_CHANNEL_STATES = {
     "active",
     "buffering",
@@ -28,20 +36,38 @@ _OCCUPYING_CHANNEL_STATES = {
 }
 
 
+def _build_request_state():
+    try:
+        from gevent.local import local as _local
+    except ImportError:
+        import threading
+
+        _local = threading.local
+        logger.warning(
+            "[smart-channel-switcherr] gevent not found; falling back to "
+            "threading.local(). Per-request delay behaviour may differ."
+        )
+
+    return _local()
+
+
+_REQUEST_STATE = _build_request_state()
+
+
 class Plugin:
     name = "Smart Channel Switcherr"
-    version = "1.0.0"
     description = (
         "Delays stream source selection to allow recently-stopped channels "
         "to fully release their provider before a new assignment runs. "
         "Optional Smart Delay only waits when the target provider is already "
-        "at its concurrent limit."
+        "at its concurrent limit for the same client."
     )
     fields = []
     actions = []
 
     def __init__(self):
-        self._original_fn = None
+        self._original_generate_stream_url = None
+        self._original_stream_ts = None
         self._proxy_views = None
         self._apply_patch()
 
@@ -54,58 +80,90 @@ class Plugin:
             import apps.proxy.ts_proxy.views as proxy_views
         except ImportError:
             logger.warning(
-                "[wait-for-selection] Cannot import apps.proxy.ts_proxy.views; "
+                "[smart-channel-switcherr] Cannot import apps.proxy.ts_proxy.views; "
                 "plugin will have no effect."
             )
             return
 
-        current = proxy_views.generate_stream_url
-        original = _unwrap_original_generate_stream_url(current)
+        current_generate = proxy_views.generate_stream_url
+        current_stream_ts = proxy_views.stream_ts
+        original_generate = _unwrap_original(
+            current_generate, _ORIGINAL_GENERATE_FN_ATTR
+        )
+        original_stream_ts = _unwrap_original(
+            current_stream_ts, _ORIGINAL_STREAM_TS_ATTR
+        )
 
-        if getattr(current, _PATCH_MARKER, False):
+        if getattr(current_generate, _GENERATE_PATCH_MARKER, False):
             logger.info(
-                "[wait-for-selection] Replacing existing generate_stream_url patch."
+                "[smart-channel-switcherr] Replacing existing generate_stream_url patch."
             )
-
-        try:
-            from gevent.local import local as _local
-        except ImportError:
-            import threading
-
-            _local = threading.local
+        if getattr(current_stream_ts, _STREAM_TS_PATCH_MARKER, False):
             logger.warning(
-                "[wait-for-selection] gevent not found; falling back to "
-                "threading.local(). Per-request delay behaviour may differ."
+                "[smart-channel-switcherr] Replacing existing stream_ts patch."
             )
 
-        _state = _local()
+        @wraps(original_stream_ts)
+        def _patched_stream_ts(request, channel_id, *args, **kwargs):
+            previous_state = _snapshot_request_state()
+            client_ip, client_user_agent = _extract_request_client_identity(request)
+            _set_request_state(
+                delay_applied=False,
+                client_ip=client_ip,
+                client_user_agent=client_user_agent,
+            )
+            try:
+                return original_stream_ts(request, channel_id, *args, **kwargs)
+            finally:
+                _restore_request_state(previous_state)
 
-        def _patched(channel_id):
-            if not getattr(_state, "delay_applied", False):
-                _state.delay_applied = True
+        @wraps(original_generate)
+        def _patched_generate_stream_url(channel_id, *args, **kwargs):
+            if not getattr(_REQUEST_STATE, "delay_applied", False):
+                _REQUEST_STATE.delay_applied = True
                 settings = _get_settings()
                 wait = _get_wait_seconds(settings)
                 if wait > 0 and _should_apply_delay(channel_id, settings):
                     _sleep_before_selection(wait, channel_id)
-            return original(channel_id)
+            return original_generate(channel_id, *args, **kwargs)
 
-        setattr(_patched, _PATCH_MARKER, True)
-        setattr(_patched, _ORIGINAL_FN_ATTR, original)
-        self._original_fn = original
+        setattr(_patched_stream_ts, _STREAM_TS_PATCH_MARKER, True)
+        setattr(_patched_stream_ts, _ORIGINAL_STREAM_TS_ATTR, original_stream_ts)
+        setattr(_patched_generate_stream_url, _GENERATE_PATCH_MARKER, True)
+        setattr(
+            _patched_generate_stream_url,
+            _ORIGINAL_GENERATE_FN_ATTR,
+            original_generate,
+        )
+        self._original_stream_ts = original_stream_ts
+        self._original_generate_stream_url = original_generate
         self._proxy_views = proxy_views
-        proxy_views.generate_stream_url = _patched
-        logger.info("[wait-for-selection] Patch applied to generate_stream_url.")
+        proxy_views.stream_ts = _patched_stream_ts
+        proxy_views.generate_stream_url = _patched_generate_stream_url
+        logger.info(
+            "[smart-channel-switcherr] Patches applied to stream_ts and "
+            "generate_stream_url."
+        )
 
     def _remove_patch(self):
         views = self._proxy_views
-        original = self._original_fn
-        if not views or not original:
+        if not views:
             return
-        current = getattr(views, "generate_stream_url", None)
-        if current is not None and getattr(current, _PATCH_MARKER, False):
-            views.generate_stream_url = original
-            logger.info("[wait-for-selection] Patch removed from generate_stream_url.")
-        self._original_fn = None
+
+        current_generate = getattr(views, "generate_stream_url", None)
+        current_stream_ts = getattr(views, "stream_ts", None)
+        if current_generate is not None and getattr(
+            current_generate, _GENERATE_PATCH_MARKER, False
+        ):
+            views.generate_stream_url = self._original_generate_stream_url
+            logger.info("[smart-channel-switcherr] Patch removed from generate_stream_url.")
+        if current_stream_ts is not None and getattr(
+            current_stream_ts, _STREAM_TS_PATCH_MARKER, False
+        ):
+            views.stream_ts = self._original_stream_ts
+            logger.info("[smart-channel-switcherr] Patch removed from stream_ts.")
+        self._original_generate_stream_url = None
+        self._original_stream_ts = None
         self._proxy_views = None
 
     # ------------------------------------------------------------------
@@ -128,7 +186,7 @@ def _sleep_before_selection(wait: float, channel_id):
         import gevent
 
         logger.debug(
-            "[wait-for-selection] Sleeping %.2fs before stream selection for %s",
+            "[smart-channel-switcherr] Sleeping %.2fs before stream selection for %s",
             wait,
             channel_id,
         )
@@ -139,8 +197,8 @@ def _sleep_before_selection(wait: float, channel_id):
         time.sleep(wait)
 
 
-def _unwrap_original_generate_stream_url(fn):
-    original = getattr(fn, _ORIGINAL_FN_ATTR, None)
+def _unwrap_original(fn, original_attr):
+    original = getattr(fn, original_attr, None)
     if callable(original):
         return original
 
@@ -151,6 +209,65 @@ def _unwrap_original_generate_stream_url(fn):
             return value
 
     return fn
+
+
+def _snapshot_request_state():
+    return {
+        "delay_applied": getattr(_REQUEST_STATE, "delay_applied", None),
+        "client_ip": getattr(_REQUEST_STATE, "client_ip", None),
+        "client_user_agent": getattr(_REQUEST_STATE, "client_user_agent", None),
+    }
+
+
+def _set_request_state(delay_applied, client_ip, client_user_agent):
+    _REQUEST_STATE.delay_applied = delay_applied
+    _REQUEST_STATE.client_ip = client_ip
+    _REQUEST_STATE.client_user_agent = client_user_agent
+
+
+def _restore_request_state(previous_state):
+    for attr, value in previous_state.items():
+        if value is None:
+            try:
+                delattr(_REQUEST_STATE, attr)
+            except AttributeError:
+                pass
+        else:
+            setattr(_REQUEST_STATE, attr, value)
+
+
+def _extract_request_client_identity(request):
+    try:
+        from apps.proxy.ts_proxy.utils import get_client_ip
+
+        client_ip = _normalize_client_value(get_client_ip(request))
+    except Exception:
+        client_ip = ""
+
+    client_user_agent = ""
+    meta = getattr(request, "META", {}) or {}
+    for header in ["HTTP_USER_AGENT", "User-Agent", "user-agent"]:
+        if header in meta:
+            client_user_agent = _normalize_client_value(meta.get(header))
+            if client_user_agent:
+                break
+
+    return client_ip, client_user_agent
+
+
+def _get_request_client_identity():
+    return {
+        "client_ip": _normalize_client_value(getattr(_REQUEST_STATE, "client_ip", "")),
+        "client_user_agent": _normalize_client_value(
+            getattr(_REQUEST_STATE, "client_user_agent", "")
+        ),
+    }
+
+
+def _normalize_client_value(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 # ------------------------------------------------------------------
@@ -209,7 +326,7 @@ def _should_apply_delay(channel_id, settings=None) -> bool:
             reason="evaluation_error",
         )
         logger.exception(
-            "[wait-for-selection] Smart Delay evaluation failed for %s; "
+            "[smart-channel-switcherr] Smart Delay evaluation failed for %s; "
             "falling back to applying delay.",
             channel_id,
         )
@@ -224,7 +341,7 @@ def _should_apply_delay(channel_id, settings=None) -> bool:
             reason="no_candidate",
         )
         logger.debug(
-            "[wait-for-selection] Smart Delay could not find an eligible target "
+            "[smart-channel-switcherr] Smart Delay could not find an eligible target "
             "stream/account for %s; skipping delay.",
             channel_id,
         )
@@ -240,7 +357,7 @@ def _should_apply_delay(channel_id, settings=None) -> bool:
     )
 
     logger.debug(
-        "[wait-for-selection] Smart Delay decision for %s: stream=%s account=%s "
+        "[smart-channel-switcherr] Smart Delay decision for %s: stream=%s account=%s "
         "active=%s limit=%s delay=%s",
         channel_id,
         decision.get("stream_name") or decision.get("stream_id"),
@@ -253,7 +370,9 @@ def _should_apply_delay(channel_id, settings=None) -> bool:
 
 
 def _build_smart_delay_decision(target_id):
-    target = _get_target_object(target_id)
+    from apps.proxy.ts_proxy.url_utils import get_stream_object
+
+    target = get_stream_object(target_id)
     candidate = _get_primary_candidate(target)
     if not candidate:
         return None
@@ -264,7 +383,22 @@ def _build_smart_delay_decision(target_id):
             {
                 "active_count": 0,
                 "active_channels": [],
+                "matching_client_found": False,
                 "reason": "unlimited",
+                "should_delay": False,
+            }
+        )
+        return candidate
+
+    request_client = _get_request_client_identity()
+    candidate.update(request_client)
+    if not request_client["client_ip"] or not request_client["client_user_agent"]:
+        candidate.update(
+            {
+                "active_count": 0,
+                "active_channels": [],
+                "matching_client_found": False,
+                "reason": "missing_request_client_identity",
                 "should_delay": False,
             }
         )
@@ -272,21 +406,35 @@ def _build_smart_delay_decision(target_id):
 
     active_channels = _get_active_channels_for_account(candidate["account_id"])
     active_count = len(active_channels)
+    matching_channel = _find_matching_client_channel(
+        active_channels,
+        request_client["client_ip"],
+        request_client["client_user_agent"],
+    )
     candidate.update(
         {
             "active_count": active_count,
             "active_channels": active_channels,
-            "reason": "at_or_over_limit" if active_count >= limit else "below_limit",
-            "should_delay": active_count >= limit,
+            "matching_client_found": bool(matching_channel),
+            "matching_channel_id": matching_channel.get("channel_id")
+            if matching_channel
+            else None,
+            "matching_stream_id": matching_channel.get("stream_id")
+            if matching_channel
+            else None,
+            "reason": _build_delay_reason(active_count, limit, matching_channel),
+            "should_delay": active_count >= limit and bool(matching_channel),
         }
     )
     return candidate
 
 
-def _get_target_object(target_id):
-    from apps.proxy.ts_proxy.url_utils import get_stream_object
-
-    return get_stream_object(target_id)
+def _build_delay_reason(active_count, limit, matching_channel) -> str:
+    if active_count < limit:
+        return "below_limit"
+    if not matching_channel:
+        return "no_matching_client"
+    return "at_or_over_limit_same_client"
 
 
 def _get_primary_candidate(target):
@@ -296,11 +444,14 @@ def _get_primary_candidate(target):
         return _build_stream_candidate(target)
 
     if isinstance(target, Channel):
-        for stream in (
+        # prefetch_related avoids an extra query per stream for profile lookup
+        streams = (
             target.streams.all()
             .select_related("m3u_account")
+            .prefetch_related("m3u_account__profiles")
             .order_by("channelstream__order")
-        ):
+        )
+        for stream in streams:
             candidate = _build_stream_candidate(stream)
             if candidate:
                 candidate["channel_id"] = str(target.uuid)
@@ -335,6 +486,8 @@ def _get_default_active_profile(m3u_account):
 
 
 def _resolve_stream_limit(m3u_account, profile) -> int:
+    # max_streams can be None (DB nullable), so `or 0` normalises None → 0.
+    # Account-level limit takes precedence; profile limit is the fallback.
     account_limit = int(getattr(m3u_account, "max_streams", 0) or 0)
     profile_limit = int(getattr(profile, "max_streams", 0) or 0)
     return account_limit if account_limit > 0 else profile_limit
@@ -355,14 +508,11 @@ def _get_active_channels_for_account(account_id):
         )
     }
 
-    matches = []
-    for item in active_channels:
-        stream = streams_by_id.get(item["stream_id"])
-        if not stream or stream.m3u_account_id != account_id:
-            continue
-        matches.append(item)
-
-    return matches
+    return [
+        item
+        for item in active_channels
+        if (s := streams_by_id.get(item["stream_id"])) and s.m3u_account_id == account_id
+    ]
 
 
 def _collect_active_channel_statuses():
@@ -390,16 +540,29 @@ def _collect_active_channel_statuses():
                 continue
 
             state = channel_info.get("state")
-            stream_id = channel_info.get("stream_id")
-            if state not in _OCCUPYING_CHANNEL_STATES or not stream_id:
+            stream_id_raw = channel_info.get("stream_id")
+            if state not in _OCCUPYING_CHANNEL_STATES or not stream_id_raw:
+                continue
+
+            # FIX: guard against non-numeric stream_id values from Redis
+            try:
+                stream_id = int(stream_id_raw)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[smart-channel-switcherr] Non-numeric stream_id %r in metadata for "
+                    "channel %s; skipping.",
+                    stream_id_raw,
+                    channel_id,
+                )
                 continue
 
             active_channels.append(
                 {
                     "channel_id": channel_id,
                     "state": state,
-                    "stream_id": int(stream_id),
+                    "stream_id": stream_id,
                     "stream_name": channel_info.get("stream_name"),
+                    "clients": _extract_channel_clients(channel_info.get("clients")),
                 }
             )
 
@@ -407,6 +570,33 @@ def _collect_active_channel_statuses():
             break
 
     return active_channels
+
+
+def _extract_channel_clients(clients):
+    normalized_clients = []
+    for client in clients or []:
+        client_ip = _normalize_client_value(client.get("ip_address"))
+        client_user_agent = _normalize_client_value(client.get("user_agent"))
+        if not client_ip and not client_user_agent:
+            continue
+        normalized_clients.append(
+            {
+                "ip_address": client_ip,
+                "user_agent": client_user_agent,
+            }
+        )
+    return normalized_clients
+
+
+def _find_matching_client_channel(active_channels, client_ip, client_user_agent):
+    for channel in active_channels:
+        for client in channel.get("clients", []):
+            if (
+                client.get("ip_address") == client_ip
+                and client.get("user_agent") == client_user_agent
+            ):
+                return channel
+    return None
 
 
 def _extract_channel_id(key) -> str:
@@ -449,9 +639,13 @@ def _log_smart_delay_event(
             account_name=decision.get("account_name"),
             active_count=decision.get("active_count"),
             limit=decision.get("limit"),
+            request_client_ip=decision.get("client_ip"),
+            request_client_user_agent=decision.get("client_user_agent"),
+            matching_client_found=decision.get("matching_client_found"),
+            matching_channel_id=decision.get("matching_channel_id"),
         )
     except Exception:
         logger.exception(
-            "[wait-for-selection] Failed to log smart-delay system event for %s",
+            "[smart-channel-switcherr] Failed to log smart-delay system event for %s",
             channel_id,
         )
