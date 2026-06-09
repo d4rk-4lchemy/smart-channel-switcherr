@@ -1,14 +1,14 @@
 """
 Smart Channel Switcherr plugin.
 
-Monkey-patches apps.proxy.ts_proxy.views.stream_ts and
-apps.proxy.ts_proxy.views.generate_stream_url to insert an optional delay
+Monkey-patches apps.proxy.live_proxy.views.stream_ts and
+apps.proxy.live_proxy.views.generate_stream_url to insert an optional delay
 before the FIRST stream source selection per request. Retries within the
 same request (same greenlet) are not delayed.
 
 If Smart Delay is enabled, the plugin only waits when the target channel's
 first eligible M3U account is already at its concurrent limit, based on the
-same Redis-backed channel metadata scan used by /proxy/ts/status, and the
+same Redis-backed channel metadata scan used by /proxy/live/status, and the
 request comes from the same client (IP + User-Agent) that already has an
 active connection on that account.
 
@@ -77,10 +77,10 @@ class Plugin:
 
     def _apply_patch(self):
         try:
-            import apps.proxy.ts_proxy.views as proxy_views
+            import apps.proxy.live_proxy.views as proxy_views
         except ImportError:
             logger.warning(
-                "[smart-channel-switcherr] Cannot import apps.proxy.ts_proxy.views; "
+                "[smart-channel-switcherr] Cannot import apps.proxy.live_proxy.views; "
                 "plugin will have no effect."
             )
             return
@@ -120,6 +120,8 @@ class Plugin:
         @wraps(original_generate)
         def _patched_generate_stream_url(channel_id, *args, **kwargs):
             if not getattr(_REQUEST_STATE, "delay_applied", False):
+                # Mark before delegating so retries inside the same stream_ts request
+                # never sleep again, including the final attempt outside the loop.
                 _REQUEST_STATE.delay_applied = True
                 settings = _get_settings()
                 wait = _get_wait_seconds(settings)
@@ -238,7 +240,7 @@ def _restore_request_state(previous_state):
 
 def _extract_request_client_identity(request):
     try:
-        from apps.proxy.ts_proxy.utils import get_client_ip
+        from apps.proxy.live_proxy.utils import get_client_ip
 
         client_ip = _normalize_client_value(get_client_ip(request))
     except Exception:
@@ -370,7 +372,7 @@ def _should_apply_delay(channel_id, settings=None) -> bool:
 
 
 def _build_smart_delay_decision(target_id):
-    from apps.proxy.ts_proxy.url_utils import get_stream_object
+    from apps.proxy.live_proxy.url_utils import get_stream_object
 
     target = get_stream_object(target_id)
     candidate = _get_primary_candidate(target)
@@ -516,15 +518,16 @@ def _get_active_channels_for_account(account_id):
 
 
 def _collect_active_channel_statuses():
-    from apps.proxy.ts_proxy.channel_status import ChannelStatus
-    from apps.proxy.ts_proxy.server import ProxyServer
+    from apps.proxy.live_proxy.channel_status import ChannelStatus
+    from apps.proxy.live_proxy.redis_keys import RedisKeys
+    from apps.proxy.live_proxy.server import ProxyServer
 
     proxy_server = ProxyServer.get_instance()
     redis_client = getattr(proxy_server, "redis_client", None)
     if not redis_client:
         return []
 
-    channel_pattern = "ts_proxy:channel:*:metadata"
+    channel_pattern = RedisKeys.channel_metadata("*")
     active_channels = []
     cursor = 0
 
@@ -535,7 +538,7 @@ def _collect_active_channel_statuses():
             if not channel_id:
                 continue
 
-            channel_info = ChannelStatus.get_basic_channel_info(channel_id)
+            channel_info = ChannelStatus.get_detailed_channel_info(channel_id)
             if not channel_info:
                 continue
 
@@ -607,7 +610,7 @@ def _extract_channel_id(key) -> str:
     if len(parts) != 4:
         return ""
 
-    if parts[0] != "ts_proxy" or parts[1] != "channel" or parts[3] != "metadata":
+    if parts[0] != "live" or parts[1] != "channel" or parts[3] != "metadata":
         return ""
 
     return parts[2]

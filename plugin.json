@@ -1,6 +1,6 @@
 {
   "name": "Wait for Stream Selection",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Delays stream source selection to allow recently-stopped channels to release their provider connections before a new channel assignment runs. Optional Smart Delay only waits when the target provider is already at its concurrent limit for the same client.",
   "author": "Tfuj Stary",
   "help_url": "https://github.com/d4rk-4lchemy/smart-channel-switcherr",

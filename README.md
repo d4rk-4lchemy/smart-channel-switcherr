@@ -4,15 +4,17 @@ A Dispatcharr plugin that delays stream source selection so that a recently-rele
 
 ## Disclaimer
 
-Developed with AI assistance (Claude / Codex).
+Developed with AI assistance (Codex).
 
 ## Installation
 
 Copy this directory to `/data/plugins/smart-channel-switcherr/` and enable the plugin in Dispatcharr.
 
+Or import downloaded ZIP file using Dispatcharr "Plugins" tab.
+
 ## How it works
 
-The plugin patches `generate_stream_url` to insert a configurable sleep before the first stream source selection in each request. Retries within the same request are never delayed.
+The plugin patches `live_proxy` stream selection to insert a configurable sleep before the first stream source selection in each request. Retries within the same request are never delayed.
 
 ## Settings
 
@@ -29,7 +31,7 @@ When Smart Delay is **enabled**, the plugin inspects the target channel's first 
 
 The client match uses the same values shown in the Dispatcharr UI: `IP Address` and `User Agent`. If the request comes from a different client, the delay is skipped because no provider slot will be released by that viewer.
 
-The active connection count is read from the same live channel metadata that powers `/proxy/ts/status` — not a cached counter — so it reflects actual proxy state at the moment of the request.
+The active connection count is read from the same live channel metadata that powers `/proxy/live/status` — not a cached counter — so it reflects actual proxy state at the moment of the request.
 
 ### Decision logic
 
